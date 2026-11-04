@@ -3,7 +3,7 @@
    server and no network calls of its own, so once it's installed it works
    permanently offline. Bump CACHE when you redeploy or phones keep the old one. */
 
-const CACHE = "closer-v1";
+const CACHE = "closer-v2";
 const SHELL = [
   "./",
   "./index.html",
@@ -32,6 +32,9 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   const req = event.request;
   if (req.method !== "GET") return;
+
+  // Never cache auth or database traffic — stale auth tokens are a nightmare.
+  if (req.url.includes("supabase.co")) return;
 
   // Navigations: serve the shell so deep links and cold starts work offline.
   if (req.mode === "navigate") {

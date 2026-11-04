@@ -3,6 +3,9 @@ import {
   BarChart, Bar, XAxis, YAxis, ResponsiveContainer, Tooltip, PieChart, Pie, Cell, Legend,
 } from "recharts";
 
+import { supabase, store, migrateLegacyLocal } from "./store.js";
+import AuthScreen from "./auth.jsx";
+
 /* ============================================================================
    CLOSER — turn money into time.
    Single-file prototype. All financial math lives in the `fin` module below and
@@ -255,39 +258,6 @@ const ALLOCATIONS = {
 /* --------------------------- 5b. PERSISTENCE ------------------------------ */
 /* Everything the user owns is saved locally on their own device. Nothing
    leaves the phone. Dates need reviving because JSON flattens them.        */
-
-const STORE_KEY = "closer.state.v1";
-
-const persistence = {
-  load() {
-    try {
-      const raw = localStorage.getItem(STORE_KEY);
-      if (!raw) return null;
-      const parsed = JSON.parse(raw);
-      if (!parsed || !parsed.profile) return null;
-      return {
-        profile: { ...parsed.profile, startedAt: new Date(parsed.profile.startedAt) },
-        contributions: (parsed.contributions || []).map((c) => ({ ...c, date: new Date(c.date) })),
-        inflationOn: !!parsed.inflationOn,
-        streak: typeof parsed.streak === "number" ? parsed.streak : 0,
-        lastActiveDay: parsed.lastActiveDay || null,
-      };
-    } catch (e) {
-      return null; // corrupt or blocked storage: start clean rather than crash
-    }
-  },
-  save(state) {
-    try {
-      localStorage.setItem(STORE_KEY, JSON.stringify(state));
-      return true;
-    } catch (e) {
-      return false;
-    }
-  },
-  clear() {
-    try { localStorage.removeItem(STORE_KEY); } catch (e) { /* ignore */ }
-  },
-};
 
 const dayKey = (d) => `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
 
@@ -846,6 +816,11 @@ function HomeScreen({ d, onAdd, onExtra }) {
   const reduced = useReducedMotion();
   return (
     <div className="px-5 pb-8">
+      {d.offline ? (
+        <div className="rounded-2xl px-4 py-2 mb-3 text-sm text-center" style={{ background: "#FBEFD8", color: C.ink }}>
+          Offline — your saves are stored here and will sync.
+        </div>
+      ) : null}
       <div className="text-center pt-2 pb-4">
         <div className="text-sm" style={{ color: C.muted }}>My savings journey</div>
         <div className="text-3xl font-semibold tracking-tight mt-1" style={{ color: C.ink }}>{money(d.goal)}</div>
@@ -1161,7 +1136,7 @@ function InsightsScreen({ d }) {
   );
 }
 
-function GoalsScreen({ d, onRisk, onInflation }) {
+function GoalsScreen({ d, onRisk, onInflation, email, offline, onSignOut }) {
   const alloc = ALLOCATIONS[d.risk];
   return (
     <div className="px-5 pb-8">
@@ -1225,6 +1200,18 @@ function GoalsScreen({ d, onRisk, onInflation }) {
           </button>
         </div>
       </Card>
+      <h3 className="text-lg font-semibold mt-6 mb-3" style={{ color: C.ink }}>Account</h3>
+      <Card className="p-4">
+        <div className="text-xs" style={{ color: C.muted }}>Signed in as</div>
+        <div className="font-medium" style={{ color: C.ink }}>{email}</div>
+        <div className="text-xs mt-2" style={{ color: C.muted }}>
+          {offline
+            ? "Offline right now. Anything you log is saved here and syncs when you reconnect."
+            : "Your goal and savings are synced to your account."}
+        </div>
+        <Button variant="ghost" className="w-full mt-4" onClick={onSignOut}>Sign out</Button>
+      </Card>
+
       <Disclaimer>
         Everything in this app is a projection, not a promise. Returns are not guaranteed, investments can lose value, and your actual result will differ.
       </Disclaimer>
@@ -1315,24 +1302,83 @@ function Sidebar({ tab, setTab, onAdd, d }) {
 /* ------------------------------ 14. APP ----------------------------------- */
 
 export default function CloserApp() {
-  const saved = useRef(persistence.load()).current;
-  const [profile, setProfile] = useState(saved ? saved.profile : null);
-  const [contributions, setContributions] = useState(saved ? saved.contributions : []);
+  const [session, setSession] = useState(undefined); // undefined = still checking
+  const [loading, setLoading] = useState(true);
+  const [offline, setOffline] = useState(false);
+  const [profile, setProfile] = useState(null);
+  const [contributions, setContributions] = useState([]);
   const [tab, setTab] = useState("home");
   const [sheet, setSheet] = useState(null); // 'actions' | 'savings' | 'extra'
   const [savingsPreset, setSavingsPreset] = useState("salary");
   const [celebration, setCelebration] = useState(null);
-  const [inflationOn, setInflationOn] = useState(saved ? saved.inflationOn : false);
-  const [streak, setStreak] = useState(saved ? saved.streak : 0);
-  const [lastActiveDay, setLastActiveDay] = useState(saved ? saved.lastActiveDay : null);
+  const [inflationOn, setInflationOn] = useState(false);
+  const [streak, setStreak] = useState(0);
+  const [lastActiveDay, setLastActiveDay] = useState(null);
 
   useEffect(() => { runEngineChecks(); }, []);
 
-  // Save on every meaningful change. Cheap: the payload is a few KB.
+  // Watch auth. One listener handles first load, sign-in and sign-out alike.
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setSession(data.session || null));
+    const { data: sub } = supabase.auth.onAuthStateChange((_evt, s) => setSession(s || null));
+    return () => sub.subscription.unsubscribe();
+  }, []);
+
+  // Load this user's data whenever a session appears.
+  useEffect(() => {
+    let cancelled = false;
+    if (session === undefined) return;
+    if (session === null) { setLoading(false); setProfile(null); setContributions([]); return; }
+
+    (async () => {
+      setLoading(true);
+      const uid = session.user.id;
+      await migrateLegacyLocal(uid).catch(() => {});
+      const res = await store.pull(uid);
+      if (cancelled) return;
+      setOffline(!res.online);
+      if (res.profile) {
+        setProfile(res.profile);
+        setContributions(res.contributions);
+        setInflationOn(!!res.profile.inflationOn);
+        setStreak(res.profile.streak || 0);
+        setLastActiveDay(res.profile.lastActiveDay || null);
+      } else {
+        setProfile(null);
+        setContributions([]);
+      }
+      setLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, [session]);
+
+  // Keep a local mirror so the app renders instantly and works offline.
   useEffect(() => {
     if (!profile) return;
-    persistence.save({ profile, contributions, inflationOn, streak, lastActiveDay });
+    store.cache({ ...profile, inflationOn, streak, lastActiveDay }, contributions);
   }, [profile, contributions, inflationOn, streak, lastActiveDay]);
+
+  // Push goal/setting changes up. Debounced so a slider drag isn't 40 writes.
+  const pushTimer = useRef(null);
+  useEffect(() => {
+    if (!profile || !session) return;
+    clearTimeout(pushTimer.current);
+    pushTimer.current = setTimeout(() => {
+      store.saveGoal({ ...profile, inflationOn, streak, lastActiveDay }, session.user.id);
+    }, 700);
+    return () => clearTimeout(pushTimer.current);
+  }, [profile, inflationOn, streak, lastActiveDay, session]);
+
+  // Retry queued writes when the network comes back.
+  useEffect(() => {
+    if (!session) return;
+    const onOnline = async () => {
+      const r = await store.flush(session.user.id);
+      if (r.flushed) { setOffline(false); const res = await store.pull(session.user.id); if (res.profile) setContributions(res.contributions); }
+    };
+    window.addEventListener("online", onOnline);
+    return () => window.removeEventListener("online", onOnline);
+  }, [session]);
 
   /* ---- derived model: one memo, everything downstream reads from it ---- */
   const d = useMemo(() => {
@@ -1406,9 +1452,9 @@ export default function CloserApp() {
       ...profile, name: profile.name, totalSaved, contributedTotal: contributed, horizonMonths, deadlineDate,
       deadlineDays, daysToGo, goalDate, aheadDays, daysReduced, requiredMonthly, progress, avgMonthly,
       contributions: [...contributions].sort((a, b) => b.date - a.date), status, milestones, insights, weekDots,
-      inflationOn, effectiveGoal, streak, done, risk: profile.risk,
+      inflationOn, effectiveGoal, streak, done, risk: profile.risk, id: profile.id, offline,
     };
-  }, [profile, contributions, inflationOn, streak]);
+  }, [profile, contributions, inflationOn, streak, offline]);
 
   /* ---- actions ---- */
   const addContribution = ({ amount, type, note, skipped }, celebrate) => {
@@ -1419,12 +1465,15 @@ export default function CloserApp() {
     const afterDate = fin.goalDate(now, d.totalSaved + amount, d.monthly, d.annual, d.effectiveGoal);
     const daysSaved = isFinite(before) && isFinite(after) ? Math.max(0, before - after) : 0;
 
-    setContributions((prev) => [
-      ...prev,
-      { id: `u${Date.now()}`, date: now, amount, type, note, skipped, daysSaved },
-    ]);
+    const local = { id: `u${Date.now()}`, date: now, amount, type, note, skipped, daysSaved };
+    setContributions((prev) => [...prev, local]);
     const st = nextStreak(streak, lastActiveDay, now);
     setStreak(st.streak); setLastActiveDay(st.lastActiveDay);
+    if (session && d.id) {
+      store.addContribution({ ...local, id: undefined, goalId: d.id }, session.user.id)
+        .then((id) => setContributions((prev) => prev.map((c) => (c === local ? { ...c, id } : c))))
+        .catch(() => setOffline(true));
+    }
     haptic();
     if (celebrate) {
       setCelebration({ amount, daysSaved, newDays: after, oldDate: beforeDate, newDate: afterDate });
@@ -1432,10 +1481,24 @@ export default function CloserApp() {
     }
   };
 
+  if (session === undefined || (session && loading)) {
+    return (
+      <div className="min-h-screen flex items-center justify-center" style={{ background: C.cream, fontFamily: FONT, color: C.muted }}>
+        Loading your journey…
+      </div>
+    );
+  }
+
+  if (session === null) return <AuthScreen />;
+
   if (!profile) {
     return (
       <Onboarding
-        onDone={(p) => { setProfile(p); setContributions([]); setStreak(0); setLastActiveDay(null); }}
+        onDone={async (p) => {
+          setContributions([]); setStreak(0); setLastActiveDay(null);
+          const id = await store.saveGoal(p, session.user.id);
+          setProfile({ ...p, id });
+        }}
       />
     );
   }
@@ -1458,7 +1521,7 @@ export default function CloserApp() {
 
         <main className="pb-28 md:pb-10 md:px-8 max-w-3xl mx-auto md:mx-0">
           {d.done && tab === "home" ? (
-            <GoalComplete d={d} onNewGoal={() => { persistence.clear(); setProfile(null); setContributions([]); setStreak(0); setLastActiveDay(null); setTab("home"); }} />
+            <GoalComplete d={d} onNewGoal={async () => { if (d.id) await store.deleteGoal(d.id); setProfile(null); setContributions([]); setStreak(0); setLastActiveDay(null); setTab("home"); }} />
           ) : (
             <>
               {tab === "home" && <HomeScreen d={d} onAdd={() => { setSavingsPreset("salary"); setSheet("savings"); }} onExtra={() => setSheet("extra")} />}
@@ -1467,7 +1530,8 @@ export default function CloserApp() {
                 onChangeReturn={(v) => setProfile((p) => ({ ...p, annual: v, risk: v >= 0.1 ? "growth" : v >= 0.08 ? "balanced" : "conservative" }))} />}
               {tab === "progress" && <ProgressScreen d={d} />}
               {tab === "insights" && <InsightsScreen d={d} />}
-              {tab === "goals" && <GoalsScreen d={d}
+              {tab === "goals" && <GoalsScreen d={d} email={session.user.email} offline={offline}
+                onSignOut={async () => { store.clearCache(); await supabase.auth.signOut(); }}
                 onRisk={(k) => setProfile((p) => ({ ...p, risk: k, annual: ALLOCATIONS[k].annual }))}
                 onInflation={setInflationOn} />}
             </>
