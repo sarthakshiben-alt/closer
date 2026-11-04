@@ -3,7 +3,7 @@
    server and no network calls of its own, so once it's installed it works
    permanently offline. Bump CACHE when you redeploy or phones keep the old one. */
 
-const CACHE = "closer-v2";
+const CACHE = "closer-v3";
 const SHELL = [
   "./",
   "./index.html",

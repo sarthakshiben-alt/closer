@@ -37,6 +37,10 @@ const writeLS = (k, v) => {
 const goalFromRow = (r) => ({
   id: r.id,
   name: r.display_name || "there",
+  label: r.label || "My goal",
+  hikeOn: !!r.hike_on,
+  hikeRate: Number(r.hike_rate),
+  lastOpenedAt: r.last_opened_at,
   goal: Number(r.target_amount),
   age: r.current_age,
   targetAge: r.target_age,
@@ -53,6 +57,9 @@ const goalFromRow = (r) => ({
 const goalToRow = (g, userId) => ({
   user_id: userId,
   display_name: g.name,
+  label: g.label || "My goal",
+  hike_on: !!g.hikeOn,
+  hike_rate: typeof g.hikeRate === "number" ? g.hikeRate : 0.10,
   target_amount: g.goal,
   current_age: g.age,
   target_age: g.targetAge,
@@ -120,6 +127,9 @@ async function applyOp(op, userId) {
       occurred_at: new Date(op.row.date).toISOString(),
     });
   }
+  if (op.kind === "archiveGoal") {
+    return supabase.from("goals").update({ archived_at: new Date().toISOString() }).eq("id", op.goalId);
+  }
   if (op.kind === "deleteGoal") {
     return supabase.from("goals").delete().eq("id", op.goalId);
   }
@@ -135,11 +145,12 @@ export const store = {
     return {
       profile: { ...c.profile, startedAt: new Date(c.profile.startedAt) },
       contributions: (c.contributions || []).map((x) => ({ ...x, date: new Date(x.date) })),
+      goals: c.goals || [],
     };
   },
 
-  cache(profile, contributions) {
-    writeLS(CACHE_KEY, { profile, contributions });
+  cache(profile, contributions, goals) {
+    writeLS(CACHE_KEY, { profile, contributions, goals: goals || [] });
   },
 
   clearCache() {
@@ -148,30 +159,49 @@ export const store = {
 
   pendingWrites: () => outbox.all().length,
 
-  /** Pull everything for the signed-in user. Falls back to cache when offline. */
-  async pull(userId) {
+  /** Pull every goal plus the contributions for the one in focus. */
+  async pull(userId, preferGoalId) {
     try {
       await outbox.flush(userId);
-      const { data: goals, error: ge } = await supabase
-        .from("goals").select("*").order("created_at", { ascending: true }).limit(1);
+      const { data: rows, error: ge } = await supabase
+        .from("goals").select("*")
+        .is("archived_at", null)
+        .order("last_opened_at", { ascending: false });
       if (ge) throw ge;
-      if (!goals || !goals.length) return { profile: null, contributions: [], online: true };
+      if (!rows || !rows.length) return { profile: null, goals: [], contributions: [], online: true };
 
-      const profile = goalFromRow(goals[0]);
-      const { data: rows, error: ce } = await supabase
+      const goals = rows.map(goalFromRow);
+      const profile = goals.find((g) => g.id === preferGoalId) || goals[0];
+
+      const { data: crows, error: ce } = await supabase
         .from("contributions").select("*")
         .eq("goal_id", profile.id).order("occurred_at", { ascending: false });
       if (ce) throw ce;
 
-      const contributions = (rows || []).map(contribFromRow);
-      store.cache(profile, contributions);
-      return { profile, contributions, online: true };
+      const contributions = (crows || []).map(contribFromRow);
+      store.cache(profile, contributions, goals);
+      return { profile, goals, contributions, online: true };
     } catch (e) {
       const c = store.cached();
       return c
         ? { ...c, online: false, error: e.message }
-        : { profile: null, contributions: [], online: false, error: e.message };
+        : { profile: null, goals: [], contributions: [], online: false, error: e.message };
     }
+  },
+
+  /** Switch focus. Ordering by last_opened_at means it follows across devices. */
+  async selectGoal(goalId, userId) {
+    try {
+      await supabase.from("goals").update({ last_opened_at: new Date().toISOString() }).eq("id", goalId);
+    } catch (e) { /* ordering is a nicety, not worth queueing */ }
+    return store.pull(userId, goalId);
+  },
+
+  async archiveGoal(goalId, userId) {
+    try {
+      await supabase.from("goals").update({ archived_at: new Date().toISOString() }).eq("id", goalId);
+    } catch (e) { outbox.push({ kind: "archiveGoal", goalId }); }
+    return store.pull(userId);
   },
 
   /** Create or update the user's goal. Returns the goal id. */

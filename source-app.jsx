@@ -44,6 +44,95 @@ export const fin = {
     return Math.pow(1 + annual, 1 / 12) - 1;
   },
 
+  /* ------------------------------------------------------------------
+     A contribution that rises every year has no closed-form solution, so
+     anything with a hike is simulated month by month. The flat case keeps
+     the exact formulas — they're faster and have no rounding drift.
+     `hike` is a fraction (0.10 = a 10% raise each year).
+     ------------------------------------------------------------------ */
+
+  /** Balance after `months`, with the contribution rising `hike` each year. */
+  futureValueHiked(pv, pmt, annual, months, hike) {
+    if (!hike) return fin.futureValue(pv, pmt, annual, months);
+    const r = fin.monthlyRate(annual);
+    let bal = pv, pay = pmt;
+    const whole = Math.floor(months);
+    for (let m = 0; m < whole; m++) {
+      if (m > 0 && m % 12 === 0) pay *= 1 + hike;
+      bal = bal * (1 + r) + pay;
+    }
+    const frac = months - whole;
+    if (frac > 0) bal = bal * (1 + r * frac) + pay * frac;
+    return bal;
+  },
+
+  /** Months until `target`, with a rising contribution. Interpolates the
+      final partial month so the answer isn't quantised to whole months. */
+  monthsToGoalHiked(pv, pmt, annual, target, hike) {
+    if (!hike) return fin.monthsToGoal(pv, pmt, annual, target);
+    if (pv >= target) return 0;
+    const r = fin.monthlyRate(annual);
+    const LIMIT = 1200; // 100 years: past this, treat it as unreachable
+    let bal = pv, pay = pmt;
+    for (let m = 0; m < LIMIT; m++) {
+      if (m > 0 && m % 12 === 0) pay *= 1 + hike;
+      const next = bal * (1 + r) + pay;
+      if (next >= target) {
+        const gain = next - bal;
+        return m + (gain > 0 ? (target - bal) / gain : 0);
+      }
+      bal = next;
+    }
+    return Infinity;
+  },
+
+  daysToGoalHiked(pv, pmt, annual, target, hike) {
+    const m = fin.monthsToGoalHiked(pv, pmt, annual, target, hike);
+    return m === Infinity ? Infinity : m * DAYS_PER_MONTH;
+  },
+
+  daysSavedByHiked(extra, pv, pmt, annual, target, hike) {
+    const before = fin.daysToGoalHiked(pv, pmt, annual, target, hike);
+    const after = fin.daysToGoalHiked(pv + extra, pmt, annual, target, hike);
+    if (before === Infinity) return after === Infinity ? 0 : Infinity;
+    return Math.max(0, before - after);
+  },
+
+  /** Starting monthly payment needed to land on target in `months`, given
+      that it will rise each year. Bisection: the balance is monotonic in
+      the starting payment, so this always converges. */
+  requiredMonthlyHiked(pv, annual, months, target, hike) {
+    if (!hike) return fin.requiredMonthlyContribution(pv, annual, months, target);
+    if (months <= 0) return Infinity;
+    if (fin.futureValueHiked(pv, 0, annual, months, hike) >= target) return 0;
+    let lo = 0, hi = Math.max(1000, target / months);
+    for (let i = 0; i < 60 && fin.futureValueHiked(pv, hi, annual, months, hike) < target; i++) hi *= 2;
+    for (let i = 0; i < 80; i++) {
+      const mid = (lo + hi) / 2;
+      if (fin.futureValueHiked(pv, mid, annual, months, hike) < target) lo = mid; else hi = mid;
+    }
+    return (lo + hi) / 2;
+  },
+
+  projectionSeriesHiked(pv, pmt, annual, years, hike) {
+    if (!hike) return fin.projectionSeries(pv, pmt, annual, years);
+    const out = [];
+    for (let y = 0; y <= years; y++) {
+      const n = y * 12;
+      const balance = fin.futureValueHiked(pv, pmt, annual, n, hike);
+      // Principal also compounds with the raises, so sum it year by year.
+      let principal = pv, pay = pmt;
+      for (let m = 0; m < n; m++) { if (m > 0 && m % 12 === 0) pay *= 1 + hike; principal += pay; }
+      out.push({
+        label: y === 0 ? "Now" : `${y}Y`,
+        contributions: Math.round(Math.min(principal, balance)),
+        growth: Math.round(Math.max(0, balance - principal)),
+        balance: Math.round(balance),
+      });
+    }
+    return out;
+  },
+
   /** FV of a lump sum plus a monthly contribution, monthly compounding. */
   futureValue(pv, pmt, annual, months) {
     const r = fin.monthlyRate(annual);
@@ -176,6 +265,34 @@ export function runEngineChecks() {
   ok("very short horizon still returns a number",
     isFinite(fin.requiredMonthlyContribution(0, 0.1, 1, 1e5)));
   ok("progress is clamped", fin.progress(5e7, 1e7) === 1 && fin.progress(-5, 1e7) === 0);
+
+  // --- hike engine: must agree with the exact formulas when hike is 0 ---
+  ok("hiked FV matches closed form at hike=0",
+    near(fin.futureValueHiked(5e5, 1.3e5, 0.1, 60, 0), fin.futureValue(5e5, 1.3e5, 0.1, 60), 0.01));
+  ok("hiked months matches closed form at hike=0",
+    near(fin.monthsToGoalHiked(5e5, 1.3e5, 0.1, 1e7, 0), fin.monthsToGoal(5e5, 1.3e5, 0.1, 1e7), 0.01));
+  ok("simulation without hike ~ closed form (drift check)",
+    near(fin.monthsToGoalHiked(5e5, 1.3e5, 0.1, 1e7, 1e-12), fin.monthsToGoal(5e5, 1.3e5, 0.1, 1e7), 0.05));
+  ok("a raise always reaches the goal sooner",
+    fin.monthsToGoalHiked(5e5, 5e4, 0.1, 1e7, 0.10) < fin.monthsToGoal(5e5, 5e4, 0.1, 1e7));
+  ok("a bigger raise is never slower",
+    fin.monthsToGoalHiked(5e5, 5e4, 0.1, 1e7, 0.20) <= fin.monthsToGoalHiked(5e5, 5e4, 0.1, 1e7, 0.10));
+  ok("hiked FV lands on target at the computed month", (() => {
+    const m = fin.monthsToGoalHiked(5e5, 5e4, 0.1, 1e7, 0.10);
+    return near(fin.futureValueHiked(5e5, 5e4, 0.1, m, 0.10), 1e7, 1e7 * 0.005);
+  })());
+  ok("required hiked payment hits the target", (() => {
+    const pmt = fin.requiredMonthlyHiked(5e5, 0.1, 66, 1e7, 0.10);
+    return near(fin.futureValueHiked(5e5, pmt, 0.1, 66, 0.10), 1e7, 50);
+  })());
+  ok("required hiked payment is lower than flat", 
+    fin.requiredMonthlyHiked(5e5, 0.1, 66, 1e7, 0.10) < fin.requiredMonthlyContribution(5e5, 0.1, 66, 1e7));
+  ok("unreachable goal with no savings is Infinity",
+    fin.monthsToGoalHiked(0, 0, 0, 1e7, 0.10) === Infinity);
+  ok("first year is unhiked (raise applies after 12 months)",
+    near(fin.futureValueHiked(0, 1000, 0, 12, 0.5), 12000, 0.01));
+  ok("raise kicks in at month 13",
+    near(fin.futureValueHiked(0, 1000, 0, 13, 0.5), 13500, 0.01));
 
   const failed = t.filter((x) => !x.pass);
   if (failed.length) console.warn("[closer] engine checks failed:", failed);
@@ -810,6 +927,139 @@ function ActionSheet({ open, onClose, onPick }) {
   );
 }
 
+
+function GoalEditorSheet({ open, onClose, onSave, initial, isNew }) {
+  const [label, setLabel] = useState("");
+  const [goal, setGoal] = useState("");
+  const [age, setAge] = useState("");
+  const [targetAge, setTargetAge] = useState("");
+  const [savings, setSavings] = useState("");
+  const [monthly, setMonthly] = useState("");
+  const [annual, setAnnual] = useState(0.1);
+  const [hikeOn, setHikeOn] = useState(false);
+  const [hikeRate, setHikeRate] = useState("10");
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const i = initial || {};
+    setLabel(i.label || (isNew ? "" : "My goal"));
+    setGoal(String(i.goal ?? ""));
+    setAge(String(i.age ?? ""));
+    setTargetAge(String(i.targetAge ?? ""));
+    setSavings(String(i.startingBalance ?? "0"));
+    setMonthly(String(i.monthly ?? ""));
+    setAnnual(i.annual ?? 0.1);
+    setHikeOn(!!i.hikeOn);
+    setHikeRate(String(Math.round((i.hikeRate ?? 0.1) * 100)));
+    setErr(null);
+  }, [open, initial, isNew]);
+
+  const num = (v) => Number(String(v).replace(/[^\d.]/g, "")) || 0;
+
+  const save = () => {
+    if (num(goal) <= 0) return setErr("Set a target amount.");
+    if (num(age) < 10 || num(age) > 120) return setErr("Enter your current age.");
+    if (num(targetAge) <= num(age)) return setErr("The target age has to be later than your age now.");
+    const rate = Math.min(100, Math.max(0, num(hikeRate)));
+    onSave({
+      ...(initial || {}),
+      label: label.trim() || "My goal",
+      goal: num(goal),
+      age: num(age),
+      targetAge: num(targetAge),
+      startingBalance: num(savings),
+      monthly: num(monthly),
+      annual,
+      hikeOn,
+      hikeRate: rate / 100,
+    });
+    onClose();
+  };
+
+  const preview = (() => {
+    const g = num(goal), a = num(age), ta = num(targetAge);
+    if (g <= 0 || ta <= a) return null;
+    const months = (ta - a) * 12;
+    const hike = hikeOn ? Math.min(100, Math.max(0, num(hikeRate))) / 100 : 0;
+    const need = fin.requiredMonthlyHiked(num(savings), annual, months, g, hike);
+    return isFinite(need) ? need : null;
+  })();
+
+  return (
+    <Sheet open={open} onClose={onClose} title={isNew ? "New goal" : "Edit goal"} tall>
+      <Field label="What's this for?">
+        <TextInput prefix="" inputMode="text" value={label} onChange={setLabel}
+          placeholder="House deposit, freedom fund, Europe trip" ariaLabel="Goal name" />
+      </Field>
+      <Field label="Target amount">
+        <TextInput value={goal ? inr.format(num(goal)) : ""} onChange={setGoal} placeholder="0" ariaLabel="Target amount" />
+      </Field>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="I'm this old now"><TextInput prefix="" value={age} onChange={setAge} ariaLabel="Current age" /></Field>
+        <Field label="Want it by age"><TextInput prefix="" value={targetAge} onChange={setTargetAge} ariaLabel="Target age" /></Field>
+      </div>
+      <Field label="Already saved toward this">
+        <TextInput value={savings ? inr.format(num(savings)) : ""} onChange={setSavings} placeholder="0" ariaLabel="Starting balance" />
+      </Field>
+      <Field label="Saving each month">
+        <TextInput value={monthly ? inr.format(num(monthly)) : ""} onChange={setMonthly} placeholder="0" ariaLabel="Monthly saving" />
+      </Field>
+
+      <Field label="Planning return">
+        <div className="flex flex-wrap gap-2">
+          {RETURN_PRESETS.map((r) => (
+            <Chip key={r.key} active={Math.abs(annual - r.value) < 0.0001} onClick={() => setAnnual(r.value)}>
+              {r.label} {Math.round(r.value * 100)}%
+            </Chip>
+          ))}
+        </div>
+      </Field>
+
+      <Card className="p-4 mb-4" style={{ background: C.sage, border: "none" }}>
+        <div className="flex items-center justify-between">
+          <div className="pr-3">
+            <div className="font-medium" style={{ color: C.ink }}>Raise my saving every year</div>
+            <div className="text-xs mt-1" style={{ color: C.muted }}>
+              Most people's income grows. If yours does, your saving can too.
+            </div>
+          </div>
+          <button onClick={() => setHikeOn(!hikeOn)} role="switch" aria-checked={hikeOn}
+            aria-label="Raise my saving every year"
+            className="rounded-full" style={{ width: 52, height: 30, background: hikeOn ? C.forest : C.line, position: "relative", flexShrink: 0 }}>
+            <span style={{ position: "absolute", top: 3, left: hikeOn ? 25 : 3, width: 24, height: 24, borderRadius: 99, background: "#fff", transition: "left 180ms" }} />
+          </button>
+        </div>
+        {hikeOn ? (
+          <div className="mt-4">
+            <div className="flex flex-wrap gap-2 mb-3">
+              {[5, 10, 15, 20].map((v) => (
+                <Chip key={v} active={num(hikeRate) === v} onClick={() => setHikeRate(String(v))}>{v}% a year</Chip>
+              ))}
+            </div>
+            <TextInput prefix="%" value={hikeRate} onChange={setHikeRate} ariaLabel="Yearly increase percent" />
+            <p className="text-xs mt-2" style={{ color: C.muted }}>
+              Applied after each full year, so the first 12 months stay at today's amount.
+            </p>
+          </div>
+        ) : null}
+      </Card>
+
+      {preview != null ? (
+        <Card className="p-4 mb-4" style={{ background: C.mint, border: "none" }}>
+          <div className="text-sm" style={{ color: C.forest }}>
+            To finish on time you'd need {money(preview)}{hikeOn ? " to start with" : ""} each month.
+          </div>
+        </Card>
+      ) : null}
+
+      {err ? <div className="rounded-2xl p-3 mb-4 text-sm" style={{ background: "#FBEAE3", color: "#8A3B1C" }}>{err}</div> : null}
+
+      <Button className="w-full" onClick={save}>{isNew ? "Create goal" : "Save changes"}</Button>
+    </Sheet>
+  );
+}
+
 /* ------------------------------ 12. SCREENS ------------------------------- */
 
 function HomeScreen({ d, onAdd, onExtra }) {
@@ -822,9 +1072,12 @@ function HomeScreen({ d, onAdd, onExtra }) {
         </div>
       ) : null}
       <div className="text-center pt-2 pb-4">
-        <div className="text-sm" style={{ color: C.muted }}>My savings journey</div>
+        <div className="text-sm" style={{ color: C.muted }}>{d.label || "My savings journey"}</div>
         <div className="text-3xl font-semibold tracking-tight mt-1" style={{ color: C.ink }}>{money(d.goal)}</div>
-        <div className="text-sm mt-1" style={{ color: C.muted }}>by age {d.targetAge} · deadline {monthLabel(d.deadlineDate)}</div>
+        <div className="text-sm mt-1" style={{ color: C.muted }}>
+          by age {d.targetAge} · deadline {monthLabel(d.deadlineDate)}
+          {d.hikeOn ? ` · saving +${Math.round(d.hikeRate * 100)}%/yr` : ""}
+        </div>
       </div>
 
       <div className="flex justify-center my-2">
@@ -866,13 +1119,16 @@ function HomeScreen({ d, onAdd, onExtra }) {
   );
 }
 
-function PlanScreen({ d, onChangeMonthly, onChangeReturn }) {
+function PlanScreen({ d, onChangeMonthly, onChangeReturn, onEditGoal }) {
   const [extra, setExtra] = useState(0);
-  const whatIfDays = fin.daysSavedByMonthly(extra, d.totalSaved, d.monthly, d.annual, d.goal);
-  const whatIfDate = fin.goalDate(new Date(), d.totalSaved, d.monthly + extra, d.annual, d.goal);
+  const nowRef = new Date();
+  const baseDays = fin.daysToGoalHiked(d.totalSaved, d.monthly, d.annual, d.effectiveGoal, d.hike);
+  const extraDays = fin.daysToGoalHiked(d.totalSaved, d.monthly + extra, d.annual, d.effectiveGoal, d.hike);
+  const whatIfDays = isFinite(baseDays) && isFinite(extraDays) ? Math.max(0, baseDays - extraDays) : 0;
+  const whatIfDate = isFinite(extraDays) ? new Date(nowRef.getTime() + extraDays * 86400000) : null;
   const series = useMemo(
-    () => fin.projectionSeries(d.totalSaved, d.monthly, d.annual, Math.max(1, Math.ceil(d.horizonMonths / 12))),
-    [d.totalSaved, d.monthly, d.annual, d.horizonMonths]
+    () => fin.projectionSeriesHiked(d.totalSaved, d.monthly, d.annual, Math.max(1, Math.ceil(d.horizonMonths / 12)), d.hike),
+    [d.totalSaved, d.monthly, d.annual, d.horizonMonths, d.hike]
   );
 
   return (
@@ -886,8 +1142,11 @@ function PlanScreen({ d, onChangeMonthly, onChangeReturn }) {
           Based on a planning return of {(d.annual * 100).toFixed(1)}% a year over {monthsToWords(d.horizonMonths)}.
         </div>
         <div className="h-px my-4" style={{ background: C.line }} />
-        <label className="block text-sm mb-2" style={{ color: C.muted }}>You're actually saving</label>
+        <label className="block text-sm mb-2" style={{ color: C.muted }}>
+          You're actually saving{d.hikeOn ? " (today — it rises each year)" : ""}
+        </label>
         <TextInput value={inr.format(d.monthly)} onChange={(v) => onChangeMonthly(Number(String(v).replace(/[^\d]/g, "")) || 0)} ariaLabel="Monthly saving" />
+        <Button variant="ghost" className="w-full mt-3" onClick={onEditGoal}>Edit this goal</Button>
         <div className="flex flex-wrap gap-2 mt-3">
           {RETURN_PRESETS.map((r) => (
             <Chip key={r.key} active={Math.abs(d.annual - r.value) < 0.0001} onClick={() => onChangeReturn(r.value)}>
@@ -942,7 +1201,12 @@ function PlanScreen({ d, onChangeMonthly, onChangeReturn }) {
       <h3 className="text-lg font-semibold mt-6 mb-3" style={{ color: C.ink }}>If markets behave differently</h3>
       <div className="grid gap-3">
         {RETURN_PRESETS.map((r) => {
-          const s = fin.scenario(d.totalSaved, d.monthly, r.value, d.goal, d.horizonMonths, new Date());
+          const sDays = fin.daysToGoalHiked(d.totalSaved, d.monthly, r.value, d.effectiveGoal, d.hike);
+          const s = {
+            requiredMonthly: fin.requiredMonthlyHiked(d.totalSaved, r.value, d.horizonMonths, d.effectiveGoal, d.hike),
+            projectedAtHorizon: fin.futureValueHiked(d.totalSaved, d.monthly, r.value, d.horizonMonths, d.hike),
+            goalDate: isFinite(sDays) ? new Date(Date.now() + sDays * 86400000) : null,
+          };
           return (
             <Card key={r.key} className="p-4">
               <div className="flex items-baseline justify-between">
@@ -1066,7 +1330,7 @@ function ProgressScreen({ d }) {
 function InsightsScreen({ d }) {
   const [buy, setBuy] = useState("15000");
   const amount = Number(String(buy).replace(/[^\d]/g, "")) || 0;
-  const daysCloser = fin.daysSavedBy(amount, d.totalSaved, d.monthly, d.annual, d.goal);
+  const daysCloser = fin.daysSavedByHiked(amount, d.totalSaved, d.monthly, d.annual, d.effectiveGoal, d.hike);
 
   return (
     <div className="px-5 pb-8">
@@ -1136,17 +1400,60 @@ function InsightsScreen({ d }) {
   );
 }
 
-function GoalsScreen({ d, onRisk, onInflation, email, offline, onSignOut }) {
+function GoalsScreen({ d, onRisk, onInflation, email, offline, onSignOut, goals, onSwitch, onEdit, onNew, onArchive }) {
   const alloc = ALLOCATIONS[d.risk];
   return (
     <div className="px-5 pb-8">
-      <Card className="p-5 mb-5">
-        <div className="text-sm" style={{ color: C.muted }}>Active goal</div>
-        <div className="text-2xl font-semibold tracking-tight mt-1" style={{ color: C.ink }}>{money(d.goal)} by age {d.targetAge}</div>
-        <div className="text-sm mt-1" style={{ color: C.muted }}>
-          {money(d.totalSaved)} saved · {isFinite(d.daysToGo) ? `${inr.format(Math.round(d.daysToGo))} days to go` : "not reachable at this pace"}
-        </div>
-      </Card>
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-lg font-semibold" style={{ color: C.ink }}>
+          Your goals{goals.length > 1 ? ` (${goals.length})` : ""}
+        </h3>
+        <Button variant="ghost" onClick={onNew} className="px-4 py-2 text-sm">+ New goal</Button>
+      </div>
+
+      <div className="grid gap-3 mb-5">
+        {goals.map((g) => {
+          const active = g.id === d.id;
+          return (
+            <Card key={g.id} className="p-4" style={active ? { borderColor: C.mintDeep, borderWidth: 2 } : {}}>
+              <button className="w-full text-left" onClick={() => (active ? null : onSwitch(g.id))}>
+                <div className="flex items-start justify-between">
+                  <div className="pr-3">
+                    <div className="font-semibold" style={{ color: C.ink }}>{g.label || "My goal"}</div>
+                    <div className="text-sm mt-1" style={{ color: C.muted }}>
+                      {money(g.goal)} by age {g.targetAge}
+                      {g.hikeOn ? ` · +${Math.round((g.hikeRate || 0) * 100)}%/yr` : ""}
+                    </div>
+                  </div>
+                  {active ? (
+                    <span className="rounded-full px-3 py-1 text-xs" style={{ background: C.mint, color: C.forest }}>Active</span>
+                  ) : (
+                    <span className="text-sm" style={{ color: C.forest }}>Switch</span>
+                  )}
+                </div>
+              </button>
+              {active ? (
+                <div className="mt-3">
+                  <div className="text-sm" style={{ color: C.muted }}>
+                    {money(d.totalSaved)} saved · {isFinite(d.daysToGo)
+                      ? `${inr.format(Math.round(d.daysToGo))} days to go`
+                      : "not reachable at this pace"}
+                  </div>
+                  <div className="mt-3 h-2 rounded-full overflow-hidden" style={{ background: C.sage }}>
+                    <div style={{ width: `${d.progress * 100}%`, height: "100%", background: C.forest, borderRadius: 99 }} />
+                  </div>
+                </div>
+              ) : null}
+              <div className="flex gap-2 mt-4">
+                <Button variant="ghost" className="px-4 py-2 text-sm" onClick={() => onEdit(g)}>Edit</Button>
+                {goals.length > 1 ? (
+                  <Button variant="quiet" className="px-4 py-2 text-sm" onClick={() => onArchive(g)}>Remove</Button>
+                ) : null}
+              </div>
+            </Card>
+          );
+        })}
+      </div>
 
       <h3 className="text-lg font-semibold mb-1" style={{ color: C.ink }}>How a portfolio like this is usually built</h3>
       <p className="text-sm mb-3" style={{ color: C.muted }}>An illustrative mix for a {monthsToWords(d.horizonMonths)} horizon.</p>
@@ -1314,6 +1621,8 @@ export default function CloserApp() {
   const [inflationOn, setInflationOn] = useState(false);
   const [streak, setStreak] = useState(0);
   const [lastActiveDay, setLastActiveDay] = useState(null);
+  const [goals, setGoals] = useState([]);
+  const [editor, setEditor] = useState(null); // {goal, isNew} | null
 
   useEffect(() => { runEngineChecks(); }, []);
 
@@ -1337,6 +1646,7 @@ export default function CloserApp() {
       const res = await store.pull(uid);
       if (cancelled) return;
       setOffline(!res.online);
+      setGoals(res.goals || []);
       if (res.profile) {
         setProfile(res.profile);
         setContributions(res.contributions);
@@ -1351,6 +1661,19 @@ export default function CloserApp() {
     })();
     return () => { cancelled = true; };
   }, [session]);
+
+  const applyPull = (res) => {
+    setGoals(res.goals || []);
+    if (res.profile) {
+      setProfile(res.profile);
+      setContributions(res.contributions || []);
+      setInflationOn(!!res.profile.inflationOn);
+      setStreak(res.profile.streak || 0);
+      setLastActiveDay(res.profile.lastActiveDay || null);
+    } else {
+      setProfile(null); setContributions([]);
+    }
+  };
 
   // Keep a local mirror so the app renders instantly and works offline.
   useEffect(() => {
@@ -1391,16 +1714,19 @@ export default function CloserApp() {
     const years = horizonMonths / 12;
     const effectiveGoal = inflationOn ? fin.realTarget(profile.goal, 0.06, years) : profile.goal;
 
-    const daysToGo = fin.daysToGoal(totalSaved, profile.monthly, profile.annual, effectiveGoal);
-    const goalDate = fin.goalDate(now, totalSaved, profile.monthly, profile.annual, effectiveGoal);
+    const hike = profile.hikeOn ? (profile.hikeRate || 0) : 0;
+    const daysToGo = fin.daysToGoalHiked(totalSaved, profile.monthly, profile.annual, effectiveGoal, hike);
+    const goalMonths = fin.monthsToGoalHiked(totalSaved, profile.monthly, profile.annual, effectiveGoal, hike);
+    const goalDate = isFinite(goalMonths)
+      ? new Date(now.getTime() + goalMonths * DAYS_PER_MONTH * 86400000) : null;
     const deadlineDays = horizonMonths * DAYS_PER_MONTH;
     const aheadDays = isFinite(daysToGo) ? deadlineDays - daysToGo : -Infinity;
 
     // Days bought back = the effect of everything beyond the plain monthly plan.
     const boostTotal = contributions.filter((c) => c.type !== "salary").reduce((s, c) => s + c.amount, 0);
-    const daysReduced = fin.daysSavedBy(boostTotal, totalSaved - boostTotal, profile.monthly, profile.annual, effectiveGoal);
+    const daysReduced = fin.daysSavedByHiked(boostTotal, totalSaved - boostTotal, profile.monthly, profile.annual, effectiveGoal, hike);
 
-    const requiredMonthly = fin.requiredMonthlyContribution(totalSaved, profile.annual, horizonMonths, effectiveGoal);
+    const requiredMonthly = fin.requiredMonthlyHiked(totalSaved, profile.annual, horizonMonths, effectiveGoal, hike);
     const progress = fin.progress(totalSaved, effectiveGoal);
 
     const loggedDays = new Set(contributions.map((c) => dayKey(c.date)));
@@ -1453,16 +1779,17 @@ export default function CloserApp() {
       deadlineDays, daysToGo, goalDate, aheadDays, daysReduced, requiredMonthly, progress, avgMonthly,
       contributions: [...contributions].sort((a, b) => b.date - a.date), status, milestones, insights, weekDots,
       inflationOn, effectiveGoal, streak, done, risk: profile.risk, id: profile.id, offline,
+      hike, hikeOn: !!profile.hikeOn, hikeRate: profile.hikeRate || 0, label: profile.label,
     };
   }, [profile, contributions, inflationOn, streak, offline]);
 
   /* ---- actions ---- */
   const addContribution = ({ amount, type, note, skipped }, celebrate) => {
     const now = new Date();
-    const before = fin.daysToGoal(d.totalSaved, d.monthly, d.annual, d.effectiveGoal);
-    const beforeDate = fin.goalDate(now, d.totalSaved, d.monthly, d.annual, d.effectiveGoal);
-    const after = fin.daysToGoal(d.totalSaved + amount, d.monthly, d.annual, d.effectiveGoal);
-    const afterDate = fin.goalDate(now, d.totalSaved + amount, d.monthly, d.annual, d.effectiveGoal);
+    const mkDate = (days) => (isFinite(days) ? new Date(now.getTime() + days * 86400000) : null);
+    const before = fin.daysToGoalHiked(d.totalSaved, d.monthly, d.annual, d.effectiveGoal, d.hike);
+    const after = fin.daysToGoalHiked(d.totalSaved + amount, d.monthly, d.annual, d.effectiveGoal, d.hike);
+    const beforeDate = mkDate(before), afterDate = mkDate(after);
     const daysSaved = isFinite(before) && isFinite(after) ? Math.max(0, before - after) : 0;
 
     const local = { id: `u${Date.now()}`, date: now, amount, type, note, skipped, daysSaved };
@@ -1496,8 +1823,9 @@ export default function CloserApp() {
       <Onboarding
         onDone={async (p) => {
           setContributions([]); setStreak(0); setLastActiveDay(null);
-          const id = await store.saveGoal(p, session.user.id);
-          setProfile({ ...p, id });
+          const id = await store.saveGoal({ ...p, label: "My goal" }, session.user.id);
+          const res = await store.pull(session.user.id, id);
+          applyPull(res);
         }}
       />
     );
@@ -1525,12 +1853,17 @@ export default function CloserApp() {
           ) : (
             <>
               {tab === "home" && <HomeScreen d={d} onAdd={() => { setSavingsPreset("salary"); setSheet("savings"); }} onExtra={() => setSheet("extra")} />}
-              {tab === "plan" && <PlanScreen d={d}
+              {tab === "plan" && <PlanScreen d={d} onEditGoal={() => setEditor({ goal: { ...profile, inflationOn, streak, lastActiveDay }, isNew: false })}
                 onChangeMonthly={(v) => setProfile((p) => ({ ...p, monthly: v }))}
                 onChangeReturn={(v) => setProfile((p) => ({ ...p, annual: v, risk: v >= 0.1 ? "growth" : v >= 0.08 ? "balanced" : "conservative" }))} />}
               {tab === "progress" && <ProgressScreen d={d} />}
               {tab === "insights" && <InsightsScreen d={d} />}
               {tab === "goals" && <GoalsScreen d={d} email={session.user.email} offline={offline}
+                goals={goals}
+                onSwitch={async (id) => { const res = await store.selectGoal(id, session.user.id); applyPull(res); setTab("home"); }}
+                onEdit={(g) => setEditor({ goal: g, isNew: false })}
+                onNew={() => setEditor({ goal: { age: profile ? profile.age : 29, annual: 0.1, startingBalance: 0, monthly: 0, hikeOn: false, hikeRate: 0.1 }, isNew: true })}
+                onArchive={async (g) => { const res = await store.archiveGoal(g.id, session.user.id); applyPull(res); }}
                 onSignOut={async () => { store.clearCache(); await supabase.auth.signOut(); }}
                 onRisk={(k) => setProfile((p) => ({ ...p, risk: k, annual: ALLOCATIONS[k].annual }))}
                 onInflation={setInflationOn} />}
@@ -1553,6 +1886,17 @@ export default function CloserApp() {
         onAdd={(c) => addContribution(c, false)} />
       <ExtraSheet open={sheet === "extra"} onClose={() => setSheet(null)}
         onAdd={(c) => addContribution(c, true)} />
+      <GoalEditorSheet
+        open={!!editor}
+        isNew={!!(editor && editor.isNew)}
+        initial={editor ? editor.goal : null}
+        onClose={() => setEditor(null)}
+        onSave={async (g) => {
+          const id = await store.saveGoal(g, session.user.id);
+          const res = await store.selectGoal(id, session.user.id);
+          applyPull(res);
+        }}
+      />
       <Celebration data={celebration} onClose={() => { setCelebration(null); setTab("home"); }} />
     </div>
   );
