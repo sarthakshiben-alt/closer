@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Closer</title>
+<meta name="description" content="Turns money saved into days bought back from your financial goal." />
+<link rel="manifest" href="manifest.webmanifest" />
+<meta name="theme-color" content="#1B4332" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Closer" />
+<link rel="apple-touch-icon" href="icon-192.png" />
+<link rel="icon" href="icon-192.png" />
+<link rel="stylesheet" href="app.css" />
+<style>
+  html, body, #root { height: 100%; }
+  body {
+    margin: 0;
+    background: #F6F8F4;
+    -webkit-font-smoothing: antialiased;
+    /* Keep content clear of the notch and the home indicator when installed. */
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+    overscroll-behavior-y: none;
+  }
+  /* No system font download, so the app works offline on first run. */
+  :root { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+  #boot { display: flex; align-items: center; justify-content: center; height: 100%; color: #6C7C73; font-size: 15px; }
+</style>
+</head>
+<body>
+<div id="root"><div id="boot">Loading…</div></div>
+<script src="app.js"></script>
+<script>
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", function () {
+      navigator.serviceWorker.register("sw.js").catch(function () { /* offline support unavailable; app still runs */ });
+    });
+  }
+</script>
+</body>
+</html>
